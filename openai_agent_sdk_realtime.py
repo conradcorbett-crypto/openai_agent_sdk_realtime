@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import os
 import queue
 import threading
 
@@ -11,6 +12,9 @@ import numpy as np
 from agents import function_tool
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from agents.realtime import RealtimeAgent, RealtimeRunner, realtime_handoff
+from langsmith import Client as LangSmithClient
+from langsmith.run_helpers import tracing_context
+from langsmith.run_trees import RunTree
 
 from tool_definitions import (
     calculate,
@@ -35,8 +39,6 @@ def parse_args():
         help="PyAudio output (speaker) device index. Run mic_detect.py to list devices.",
     )
     return parser.parse_args()
-
-
 
 
 # Wrap tool functions for the agents SDK
@@ -172,42 +174,119 @@ async def main(*, input_device_index: int = 0, output_device_index: int = 1):
     print("Agents: Weather | Calculator | Python Code | File Writer")
     print("Triage agent will route your requests.\n")
 
-    async with await runner.run() as session:
-        async def send_mic_audio():
-            """Reads from hardware and uses the validated 'send_audio' method."""
-            tick = 0
-            try:
-                while True:
-                    raw_data = await asyncio.to_thread(mic.read, CHUNK, False)
+    ls_client = LangSmithClient()
+    session_run = RunTree(
+        name="realtime-session",
+        run_type="chain",
+        project_name=os.getenv("LANGSMITH_PROJECT", "default"),
+        ls_client=ls_client,
+        tags=["openai-agents-sdk", "realtime"],
+    )
+    session_run.post()
 
-                    tick += 1
-                    if tick % MIC_METER_EVERY_N_CHUNKS == 0:
-                        audio_data = np.frombuffer(raw_data, dtype=np.int16).astype(np.float64)
-                        rms = np.sqrt(np.mean(audio_data**2))
-                        meter = int(min(rms / 50, 50))
-                        print(f"Mic Level: {'█' * meter}{' ' * (50-meter)} |", end="\r")
+    try:
+        with tracing_context(parent=session_run, enabled=True):
+            async with await runner.run() as session:
+                async def send_mic_audio():
+                    """Reads from hardware and uses the validated 'send_audio' method."""
+                    tick = 0
+                    try:
+                        while True:
+                            raw_data = await asyncio.to_thread(mic.read, CHUNK, False)
 
-                    await session.send_audio(raw_data)
-            except Exception:
-                pass
+                            tick += 1
+                            if tick % MIC_METER_EVERY_N_CHUNKS == 0:
+                                audio_data = np.frombuffer(raw_data, dtype=np.int16).astype(np.float64)
+                                rms = np.sqrt(np.mean(audio_data**2))
+                                meter = int(min(rms / 50, 50))
+                                print(f"Mic Level: {'█' * meter}{' ' * (50-meter)} |", end="\r")
 
-        async def handle_events():
-            """Iterates over the session as an AsyncIterator."""
-            async for event in session:
-                if event.type == "audio":
-                    playback_queue.put_nowait(event.audio.data)
-                elif event.type == "audio_interrupted":
-                    flush_playback()
-                    print("\n[interrupted]")
-                elif event.type == "transcript_delta":
-                    print(event.delta, end="", flush=True)
+                            await session.send_audio(raw_data)
+                    except Exception:
+                        pass
 
-        # Execute
-        mic_task = asyncio.create_task(send_mic_audio())
-        try:
-            await handle_events()
-        finally:
-            mic_task.cancel()
+                async def handle_events():
+                    """Iterates over the session as an AsyncIterator."""
+                    last_user_input: str = ""
+                    transcript_parts: list[str] = []
+                    current_turn_run: RunTree | None = None
+
+                    try:
+                        async for event in session:
+                            if event.type == "audio":
+                                playback_queue.put_nowait(event.audio.data)
+                            elif event.type == "audio_interrupted":
+                                flush_playback()
+                                print("\n[interrupted]")
+
+                            # transcript_delta is forwarded as raw_model_event, not a
+                            # top-level session event — so match on event.data.type.
+                            elif event.type == "raw_model_event":
+                                raw = event.data
+                                raw_type = getattr(raw, "type", None)
+                                if raw_type == "transcript_delta":
+                                    delta = getattr(raw, "delta", "") or ""
+                                    if delta:
+                                        print(delta, end="", flush=True)
+                                        transcript_parts.append(delta)
+                                elif raw_type == "input_audio_transcription_completed":
+                                    t = getattr(raw, "transcript", "") or ""
+                                    if t:
+                                        last_user_input = t
+                                        if current_turn_run is not None:
+                                            current_turn_run.inputs["input"] = t
+
+                            elif event.type == "history_added":
+                                item = event.item
+                                role = getattr(item, "role", None)
+                                if role == "user":
+                                    for c in getattr(item, "content", []):
+                                        t = getattr(c, "transcript", None) or getattr(c, "text", None)
+                                        if t:
+                                            last_user_input = t
+                                            if current_turn_run is not None:
+                                                current_turn_run.inputs["input"] = t
+                                            break
+
+                            elif event.type == "agent_start":
+                                if current_turn_run is None:
+                                    current_turn_run = session_run.create_child(
+                                        name=event.agent.name,
+                                        run_type="llm",
+                                        inputs={"input": last_user_input},
+                                        tags=["openai-agents-sdk", "realtime"],
+                                    )
+                                    await asyncio.to_thread(current_turn_run.post)
+                                    transcript_parts = []
+
+                            # agent_end fires after audio is done — transcript_parts is complete.
+                            elif event.type == "agent_end":
+                                if current_turn_run is not None and transcript_parts:
+                                    tr = current_turn_run
+                                    tr.inputs["input"] = last_user_input
+                                    tr.end(outputs={"output": "".join(transcript_parts)})
+                                    await asyncio.to_thread(tr.patch)
+                                    current_turn_run = None
+                                    transcript_parts = []
+
+                            elif event.type == "handoff":
+                                print(f"\n[handoff → {event.to_agent.name}]")
+                    finally:
+                        if current_turn_run is not None:
+                            output = "".join(transcript_parts) or "(interrupted)"
+                            current_turn_run.end(outputs={"output": output})
+                            current_turn_run.patch()
+
+                # Execute
+                mic_task = asyncio.create_task(send_mic_audio())
+                try:
+                    await handle_events()
+                finally:
+                    mic_task.cancel()
+    finally:
+        session_run.end()
+        session_run.patch()
+        print(f"\nLangSmith trace: {session_run.trace_id}")
 
     # Cleanup
     playback_queue.put(None)
