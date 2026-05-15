@@ -76,6 +76,31 @@ Talk into the mic. Press `Ctrl+C` to exit.
 - *"Write a Python script that prints the first ten Fibonacci numbers and run it."* → **PythonCodeAgent**
 - *"Save a file at notes.txt that says hello world."* → **FileWriterAgent**
 
+## LangSmith Traces
+
+**Triage Agent** — routes the weather question and responds before handing off.
+![Triage Agent run](screenshots/image.png)
+
+**WeatherAgent** — delivers the final weather answer after the tool call.
+![WeatherAgent run](screenshots/image-1.png)
+
+**get_weather tool** — raw input/output of the weather tool call (city → JSON).
+![get_weather tool call](screenshots/image-2.png)
+
+**WeatherAgent (second query)** — triage hands off a math question to WeatherAgent, which passes it on.
+![WeatherAgent handoff to calculator](screenshots/image-3.png)
+
+**CalculatorAgent** — receives the math question and prepares to run the tool.
+![CalculatorAgent run](screenshots/image-4.png)
+
+**calculate tool** — expression `47*39` evaluated, result `1833`.
+![calculate tool call](screenshots/image-5.png)
+
+**CalculatorAgent (after tool)** — speaks the result back to the user.
+![CalculatorAgent result](screenshots/image-6.png)
+
+**CalculatorAgent (follow-up)** — handles a follow-up conversational turn ("Great, thanks.").
+![CalculatorAgent follow-up](screenshots/image-7.png)
 ## Files
 
 | File | Purpose |
@@ -92,3 +117,4 @@ Talk into the mic. Press `Ctrl+C` to exit.
 - **No audio playback** — same fix as above, but for `--output-device`.
 - **`401 Unauthorized`** — your `OPENAI_API_KEY` is missing, invalid, or doesn't have Realtime API access. Confirm `.env` exists in this folder and contains a valid key.
 - **PyAudio install fails on Linux** — install PortAudio first: `sudo apt-get install portaudio19-dev`.
+
