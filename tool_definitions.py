@@ -3,7 +3,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from langsmith import traceable
 
+
+@traceable(run_type="tool")
 def get_weather(city: str) -> str:
     """Get the current weather for a city.
 
@@ -13,6 +16,7 @@ def get_weather(city: str) -> str:
     return json.dumps({"city": city, "temperature": "72°F", "condition": "sunny"})
 
 
+@traceable(run_type="tool")
 def calculate(expression: str) -> str:
     """Evaluate a math expression and return the result.
 
@@ -26,6 +30,7 @@ def calculate(expression: str) -> str:
         return f"Error: {e}"
 
 
+@traceable(run_type="tool")
 def run_python_code(code: str) -> str:
     """Write and execute a Python script, returning its stdout/stderr.
 
@@ -57,6 +62,7 @@ def run_python_code(code: str) -> str:
         script_path.unlink(missing_ok=True)
 
 
+@traceable(run_type="tool")
 async def write_file(file_path: str, content: str) -> str:
     """Write content to a file on disk.
 
